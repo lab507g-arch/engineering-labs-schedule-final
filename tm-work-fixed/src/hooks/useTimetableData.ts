@@ -11,7 +11,7 @@ import {
 } from '@/config';
 import { parseCSV, getField, type CsvRow } from '@/utils/csv';
 import { processHolidayRollover, type ProcessedHoliday } from '@/utils/dates';
-import { isHolidayTab, isTermTab, type SheetTab } from '@/utils/sheetTabs';
+import { isHolidayTab, isTermTab } from '@/utils/sheetTabs';
 
 interface TimetableDataState {
   sessions: LabSession[];
@@ -41,7 +41,6 @@ function parseDay(value: string): DayKey | null {
   return null;
 }
 
-// ponytail: convert 12h time+ampm to 24h string "HH:MM"
 function to24h(time: string, ampm: string | undefined): string {
   const [hStr, mStr] = time.split(':');
   let h = parseInt(hStr, 10);
@@ -57,7 +56,6 @@ function to24h(time: string, ampm: string | undefined): string {
 
 function parseTimeRange(period: string): { startTime: string; endTime: string } | null {
   const text = period.trim();
-  // Captures AM/PM so we can convert correctly
   const rangeMatch = /(\d{1,2}:\d{2})\s*(AM|PM)?\s*(?:-|–|—|to|إلى|الى)\s*(\d{1,2}:\d{2})\s*(AM|PM)?/i.exec(text);
   if (rangeMatch) {
     return {
@@ -70,8 +68,16 @@ function parseTimeRange(period: string): { startTime: string; endTime: string } 
 
 function isHtmlResponse(text: string): boolean {
   const t = text.trimStart();
-  // ponytail: catches <!DOCTYPE, <html, <HTML, redirect pages, etc.
-  return /^<[!h]/i.test(t);
+  return /^<[!h]/i.test(t) || t.includes('<!DOCTYPE') || t.includes('<html');
+}
+
+// تنظيف أسماء الأعمدة من المسافات الزائدة والـ BOM
+function normalizeRow(row: CsvRow): CsvRow {
+  const newRow: CsvRow = {};
+  for (const [key, value] of Object.entries(row)) {
+    newRow[key.trim()] = value;
+  }
+  return newRow;
 }
 
 function rowToSession(row: CsvRow, index: number, fallbackLab: string): LabSession | null {
@@ -94,7 +100,6 @@ function rowToSession(row: CsvRow, index: number, fallbackLab: string): LabSessi
     }
   }
 
-  // If startTime came from explicit column, still run through to24h if it has AM/PM
   if (startTime && /am|pm/i.test(startTime)) {
     const m = /(\d{1,2}:\d{2})\s*(AM|PM)/i.exec(startTime);
     if (m) startTime = to24h(m[1], m[2]);
@@ -177,18 +182,36 @@ function saveCache(sessions: LabSession[], holidays: Holiday[], term: TermConfig
 }
 
 // ---------------------------------------------------------------------------
-// CORS PROXY – Google Sheets does not send CORS headers for direct fetches.
-// All remote requests go through a proxy so the browser can read the response.
-// Replace the proxy URL below with your own if needed.
+// CORS Proxy – بنجرب أكتر من Proxy عشان نضمن إننا هننجح
 // ---------------------------------------------------------------------------
-const CORS_PROXY = 'https://api.allorigins.win/raw?url=';
+const PROXIES = [
+  'https://api.codetabs.com/v1/proxy?quest=',
+  'https://corsproxy.io/?',
+  'https://api.allorigins.win/raw?url=',
+];
 
 async function proxiedFetch(url: string): Promise<Response> {
-  return fetch(`${CORS_PROXY}${encodeURIComponent(url)}`, { credentials: 'omit' });
+  let lastError: Error | null = null;
+  for (const proxy of PROXIES) {
+    try {
+      const res = await fetch(`${proxy}${encodeURIComponent(url)}`, { credentials: 'omit' });
+      if (res.ok) {
+        const text = await res.clone().text();
+        // لو الـ Proxy رجع صفحة HTML (زي صفحة خطأ)، يبقى فشل
+        if (!text.includes('<!DOCTYPE') && !text.includes('<html')) {
+          return res;
+        }
+      }
+    } catch (e) {
+      lastError = e instanceof Error ? e : new Error(String(e));
+      console.warn(`[labs] Proxy failed: ${proxy}`, lastError.message);
+    }
+  }
+  throw lastError || new Error('All CORS proxies failed');
 }
 
 // ---------------------------------------------------------------------------
-// Tab discovery – parse the pubhtml page to get sheet names + gids.
+// اكتشاف التابات من صفحة pubhtml
 // ---------------------------------------------------------------------------
 interface DiscoveredTab {
   name: string;
@@ -201,14 +224,14 @@ async function discoverTabsFromPubhtml(pubhtmlUrl: string): Promise<DiscoveredTa
   const html = await res.text();
 
   const tabs: DiscoveredTab[] = [];
-  // Matches: items.push({name: "312", pageUrl: "...", gid: "335238377", ...});
+  // الـ Regex ده بيدور على name و gid جوه الـ items.push
   const regex = /name:\s*"([^"]+)"[^}]*?gid:\s*"([^"]+)"/g;
   let match: RegExpExecArray | null;
   while ((match = regex.exec(html)) !== null) {
     tabs.push({ name: match[1], gid: match[2] });
   }
 
-  // Deduplicate by gid (the same gid can appear multiple times)
+  // شيل التابات المكررة
   const seen = new Set<string>();
   return tabs.filter(t => {
     if (seen.has(t.gid)) return false;
@@ -218,7 +241,7 @@ async function discoverTabsFromPubhtml(pubhtmlUrl: string): Promise<DiscoveredTa
 }
 
 // ---------------------------------------------------------------------------
-// Sheet fetching
+// تحميل بيانات الشيتات
 // ---------------------------------------------------------------------------
 interface FetchedSheet {
   name: string;
@@ -226,8 +249,10 @@ interface FetchedSheet {
 }
 
 async function fetchSheetCSVByGid(gid: string, name: string): Promise<FetchedSheet | null> {
-  // Build a reliable CSV URL for a published sheet using its gid.
-  const url = `${SHEET_CSV_BASE_URL}&gid=${gid}&single=true&output=csv`;
+  // نضمن إن الرابط فيه ? قبل ما نضيف &
+  const baseUrl = SHEET_CSV_BASE_URL.includes('?') ? SHEET_CSV_BASE_URL : `${SHEET_CSV_BASE_URL}?`;
+  const url = `${baseUrl}&gid=${gid}&single=true&output=csv`;
+  
   try {
     const res = await proxiedFetch(url);
     if (!res.ok) {
@@ -236,7 +261,7 @@ async function fetchSheetCSVByGid(gid: string, name: string): Promise<FetchedShe
     }
     const text = await res.text();
     if (!text || isHtmlResponse(text)) {
-      console.warn(`[labs] sheet "${name}" returned HTML (not published or wrong gid)`);
+      console.warn(`[labs] sheet "${name}" returned HTML or empty`);
       return null;
     }
     const lines = text.split('\n').filter(l => l.trim());
@@ -244,7 +269,8 @@ async function fetchSheetCSVByGid(gid: string, name: string): Promise<FetchedShe
       console.warn(`[labs] sheet "${name}" has no data rows`);
       return null;
     }
-    return { name, text };
+    // شيل الـ BOM من أول النص
+    return { name, text: text.replace(/^\uFEFF/, '') };
   } catch (e) {
     console.warn(`[labs] fetch error for sheet "${name}" (gid=${gid}):`, e instanceof Error ? e.message : e);
     return null;
@@ -252,7 +278,9 @@ async function fetchSheetCSVByGid(gid: string, name: string): Promise<FetchedShe
 }
 
 async function fetchSheetCSVByName(name: string): Promise<FetchedSheet | null> {
-  const url = `${SHEET_CSV_BASE_URL}&sheet=${encodeURIComponent(name)}&output=csv`;
+  const baseUrl = SHEET_CSV_BASE_URL.includes('?') ? SHEET_CSV_BASE_URL : `${SHEET_CSV_BASE_URL}?`;
+  const url = `${baseUrl}&sheet=${encodeURIComponent(name)}&output=csv`;
+  
   try {
     const res = await proxiedFetch(url);
     if (!res.ok) {
@@ -261,7 +289,7 @@ async function fetchSheetCSVByName(name: string): Promise<FetchedSheet | null> {
     }
     const text = await res.text();
     if (!text || isHtmlResponse(text)) {
-      console.warn(`[labs] sheet "${name}" returned HTML (not published or wrong name)`);
+      console.warn(`[labs] sheet "${name}" returned HTML or empty`);
       return null;
     }
     const lines = text.split('\n').filter(l => l.trim());
@@ -269,7 +297,7 @@ async function fetchSheetCSVByName(name: string): Promise<FetchedSheet | null> {
       console.warn(`[labs] sheet "${name}" has no data rows`);
       return null;
     }
-    return { name, text };
+    return { name, text: text.replace(/^\uFEFF/, '') };
   } catch (e) {
     console.warn(`[labs] fetch error for sheet "${name}":`, e instanceof Error ? e.message : e);
     return null;
@@ -277,7 +305,7 @@ async function fetchSheetCSVByName(name: string): Promise<FetchedSheet | null> {
 }
 
 // ---------------------------------------------------------------------------
-// Hook
+// الـ Hook الرئيسي
 // ---------------------------------------------------------------------------
 export function useTimetableData(): TimetableDataState {
   const [sessions, setSessions] = useState<LabSession[]>(FALLBACK_TIMETABLE);
@@ -303,7 +331,7 @@ export function useTimetableData(): TimetableDataState {
       try {
         let allFetched: FetchedSheet[] = [];
 
-        // 1. Try to discover tabs from the pubhtml page (gives us gids + names)
+        // 1. نحاول نكتشف التابات من صفحة pubhtml
         try {
           const discovered = await discoverTabsFromPubhtml(SHEET_PUBHTML_URL);
           if (discovered.length > 0) {
@@ -318,7 +346,7 @@ export function useTimetableData(): TimetableDataState {
           console.warn('[labs] discoverTabsFromPubhtml failed:', e);
         }
 
-        // 2. If discovery failed, fall back to known tab names
+        // 2. لو فشل الاكتشاف، نجرب الأسماء المعروفة
         if (allFetched.length === 0 && KNOWN_TAB_NAMES.length > 0) {
           console.log('[labs] trying KNOWN_TAB_NAMES:', KNOWN_TAB_NAMES);
           const results = await Promise.all(KNOWN_TAB_NAMES.map(fetchSheetCSVByName));
@@ -338,7 +366,7 @@ export function useTimetableData(): TimetableDataState {
           return;
         }
 
-        // 3. Classify and parse — reuse fetched text, no second HTTP request
+        // 3. نصنف الشيتات ونحلل البيانات
         const roomSheets = allFetched.filter(s => !isHolidayTab(s.name) && !isTermTab(s.name));
         const holidaySheets = allFetched.filter(s => isHolidayTab(s.name));
         const termSheets = allFetched.filter(s => isTermTab(s.name));
@@ -352,7 +380,9 @@ export function useTimetableData(): TimetableDataState {
             console.log(`[labs] CSV headers for "${sheet.name}":`, Object.keys(rows[0] ?? {}));
           }
           for (const row of rows) {
-            const s = rowToSession(row, sessionIdx++, sheet.name);
+            // ننظف أسماء الأعمدة قبل القراءة
+            const normalizedRow = normalizeRow(row);
+            const s = rowToSession(normalizedRow, sessionIdx++, sheet.name);
             if (s) allSessions.push(s);
           }
         }
@@ -362,7 +392,7 @@ export function useTimetableData(): TimetableDataState {
         let newHolidays: Holiday[] = FALLBACK_HOLIDAYS;
         if (holidaySheets.length > 0) {
           const parsed = holidaySheets.flatMap(s =>
-            parseCSV(s.text).map((r, i) => rowToHoliday(r, i)).filter((h): h is Holiday => !!h)
+            parseCSV(s.text).map((r, i) => rowToHoliday(normalizeRow(r), i)).filter((h): h is Holiday => !!h)
           );
           if (parsed.length > 0) newHolidays = parsed;
         }
@@ -370,7 +400,7 @@ export function useTimetableData(): TimetableDataState {
         let newTerm: TermConfig = FALLBACK_TERM;
         if (termSheets.length > 0) {
           const parsed = termSheets.flatMap(s =>
-            parseCSV(s.text).map(rowToTerm).filter((t): t is TermConfig => !!t)
+            parseCSV(s.text).map(r => rowToTerm(normalizeRow(r))).filter((t): t is TermConfig => !!t)
           );
           if (parsed.length > 0) newTerm = parsed[parsed.length - 1];
         }
